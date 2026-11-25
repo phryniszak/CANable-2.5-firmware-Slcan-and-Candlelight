@@ -58,7 +58,7 @@ typedef enum // sent as 4 bit
 // These flags are reset after sending them once to the host
 // They are set again if the error is still present
 // Slcan sends this in the error report "EXXXXXXXX\r"
-// Candlelight sends this in a special error packet with a flag (legacy: CAN_ID_Error, ElmüSoft: MSG_Error)
+// Candlelight sends this in a special error packet with a flag (legacy: CAN_ID_Error, Elmï¿½Soft: MSG_Error)
 typedef enum // sent as 8 bit
 {
     APP_CanRxFail       = 0x01, // CAN packets arrive faster than the firmware can process them
@@ -380,6 +380,22 @@ typedef enum // sent as 8 bit
 // 0xXX = any other value is invalid!
 #ifndef USBD_SELF_POWERED
     #define USBD_SELF_POWERED   0x00
+#endif
+
+// ------------------------------- Clock Output (debug) ----------------------
+
+// Output an internal clock on pin PA8 (MCO = Microcontroller Clock Output) to measure it
+// with a frequency counter or an oscilloscope. Disabled by default, do not enable in release builds.
+// Sources: RCC_MCO1SOURCE_HSI    = 16 MHz RC oscillator (PLL input for FDCAN on boards without quartz)
+//          RCC_MCO1SOURCE_HSI48  = 48 MHz USB oscillator (trimmed by the CRS)
+//          RCC_MCO1SOURCE_SYSCLK = system clock (160 / 60 MHz, use a divider!)
+// Divider: RCC_MCODIV_1, RCC_MCODIV_2, RCC_MCODIV_4, RCC_MCODIV_8, RCC_MCODIV_16
+// ATTENTION: PA8 must not be used by the board for anything else (no board in this file uses it).
+// Enable here or with -DMCO_SOURCE=RCC_MCO1SOURCE_HSI in the compiler flags.
+// #define MCO_SOURCE          RCC_MCO1SOURCE_HSI
+
+#if defined(MCO_SOURCE) && !defined(MCO_DIVIDER)
+    #define MCO_DIVIDER         RCC_MCODIV_1
 #endif
 
 

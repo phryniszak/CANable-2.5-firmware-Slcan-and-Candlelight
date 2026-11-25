@@ -162,6 +162,14 @@ bool system_init(void)
     HAL_RCCEx_CRSConfig(&CRS_Init);
 
     // --------------------------------------------
+
+#if defined(MCO_SOURCE)
+    // Debug option (see settings.h): output the selected clock on pin PA8 to measure it with a frequency counter.
+    // HAL_RCC_MCOConfig() enables the GPIOA clock and switches PA8 to alternate function AF0 (MCO).
+    HAL_RCC_MCOConfig(RCC_MCO_PA8, MCO_SOURCE, MCO_DIVIDER);
+#endif
+
+    // --------------------------------------------
     
     // Provide GPIO ports with clock, must be executed before calling HAL_GPIO_Init()
     __HAL_RCC_GPIOA_CLK_ENABLE(); // Enable GPIO Port A used for LED's
