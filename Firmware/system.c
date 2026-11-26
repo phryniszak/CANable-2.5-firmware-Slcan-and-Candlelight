@@ -242,11 +242,20 @@ uint32_t system_get_can_clock()
 // A window only starts and ends on a "clean" SOF that arrived 1 frame and approx. 1 ms after the previous one,
 // so a delayed ISR at the start or end of the window cannot falsify the result.
 //
-// STM32G4 datasheet (HSI16 characteristics): the trim step is 0.2 ... 0.4 %, but stepping onto a code that is
-// a multiple of 64 changes the frequency by -4 ... -8 %. HSITRIM therefore consists of two monotonic segments
-// [0..63] and [64..127] where code c in the lower segment is approx. as fast as code c + CAL_SEG_OFFSET in the upper.
-// The calibration never steps across the boundary. It jumps to the equivalent code in the other segment instead,
-// and only while no CAN channel is open. If the jump turns out to be wrong, it is reverted and never tried again.
+// STM32G4: the oscillator uses HSICAL = factory calibration + HSITRIM - 64 (both visible in RCC->ICSCR).
+// The trim step is 0.2 ... 0.4 %, but where HSICAL steps onto a multiple of 64 (64*k - 1 -> 64*k)
+// the frequency drops by 4 ... 8 % (datasheet: "trimming code is a multiple of 64").
+// Measured on a STM32G431 with HSICAL = 138 at HSITRIM = 64:
+// HSITRIM 53 -> 54 (HSICAL 127 -> 128) = -6.1 %, HSITRIM 117 -> 118 (HSICAL 191 -> 192) = -4.6 %.
+// So the jumps are at chip specific HSITRIM codes. They are calculated from HSICAL at runtime.
+// Between the jumps the codes form monotonic blocks. Code c of a block is approx. as fast as code c + offset
+// of the next higher block. The offset (14 ... 21 codes) is not an integer and is learned for each boundary.
+// The calibration never steps across a boundary. It jumps to the equivalent code in the neighbour block instead,
+// and only while no CAN channel is open. A wrong jump is reverted, after 3 wrong jumps no more jumps are made.
+//
+// Because the offset is not an integer, the codes of neighbour blocks interleave. When the error is already
+// below the threshold, the closest code of a neighbour block is often better. It is tried for one window
+// (only while CAN is closed) and kept if the measured error is smaller, otherwise the previous code is restored.
 
 #define CAL_WINDOW_FRAMES   1000  // measure over 1 second -> resolution 1 ppm
 #define CAL_CLEAN_DEV        200  // a SOF is "clean" if it arrives 1000 +/- 200 us after the previous one
@@ -254,18 +263,23 @@ uint32_t system_get_can_clock()
 #define CAL_STEP_INIT       2000  // initial estimate of one HSITRIM step in ppm (datasheet min = 0.2%), learned at runtime
 #define CAL_STEP_MIN        1000
 #define CAL_STEP_MAX        6000
-#define CAL_MAX_ERR        30000  // 3%: larger errors are only possible after a wrong segment jump
+#define CAL_NOISE_PPM        200  // wander of the RC oscillator between two windows (measured: +/- 60 ... 100 ppm)
+#define CAL_MAX_ERR        30000  // 3%: a jump between blocks that ends with a larger error, which is not smaller than before, was wrong
 #define CAL_REVERT_US    3000000  // revert a trim change if no valid measurement was possible within 3 seconds
+#define CAL_MAX_FAILS          3  // after 3 wrong jumps between blocks, jumps are no longer made
 #define CAL_TRIM_MAX         127
 
 #if defined(STM32G4xx)
     #define CAL_SEGMENTS     1
-    #define CAL_SEG_LOW     64    // first code of the upper segment
-    #define CAL_SEG_OFFSET  21    // approx. 6% / 0.3%
+    #define CAL_BOUNDARIES   3    // HSITRIM 0 ... 127 contains at most 3 boundaries between blocks
+    #define CAL_OFFSET_INIT 2100  // offset between neighbour blocks in 1/100 steps (approx. 6% / 0.3%), learned at runtime
+    #define CAL_OFFSET_MIN   800  // measured: 14 ... 21 steps (4.6 ... 6.1 %)
+    #define CAL_OFFSET_MAX  3200
 #endif
 
 static struct
 {
+    bool     disabled;        // for tests: set with the debugger -> measure, but do not change the trim
     bool     synced;          // last_frame and last_us are valid
     bool     window;          // a measurement window is running
     uint16_t last_frame;      // last USB frame number (11 bit)
@@ -276,12 +290,26 @@ static struct
     // state after a trim change
     bool     changed;         // the trim was changed and not yet verified by a measurement
     bool     crossed;         // the change was a jump into the other segment
-    bool     no_cross;        // a segment jump has failed -> never jump again
+    bool     trial;           // the change is a trial of a neighbour block (keep only if better)
+    uint8_t  cross_fails;     // count of wrong jumps between blocks (reverted)
     int32_t  prev_trim;       // trim before the change (for revert)
-    int32_t  prev_err_ppm;    // error before the change (for learning the step size)
+    int32_t  prev_err_ppm;    // error before the change (for learning)
     int32_t  steps;           // count of steps of the change
     uint32_t since_change_us; // time since the change
-} hsi_cal = { .step_ppm = CAL_STEP_INIT };
+#if defined(CAL_SEGMENTS)
+    bool     offset_learned[CAL_BOUNDARIES]; // offset100 has been measured
+    int32_t  offset100[CAL_BOUNDARIES];      // offset at each boundary in 1/100 steps
+    int32_t  tried_trim;      // the neighbour blocks have been evaluated for this trim ...
+    int32_t  tried_err_ppm;   // ... at this error (re-evaluated when the error drifts)
+#endif
+} hsi_cal =
+{
+    .step_ppm   = CAL_STEP_INIT,
+#if defined(CAL_SEGMENTS)
+    .offset100  = { CAL_OFFSET_INIT, CAL_OFFSET_INIT, CAL_OFFSET_INIT },
+    .tried_trim = -1,
+#endif
+};
 
 static volatile int32_t hsi_error_ppm = 0; // last measured error (positive = HSI16 too fast), for the debugger
 
@@ -292,30 +320,157 @@ static inline int32_t cal_get_trim()
     return (RCC->ICSCR & RCC_ICSCR_HSITRIM) >> RCC_ICSCR_HSITRIM_Pos;
 }
 
+static void cal_set_trim(int32_t trim, bool crossed, bool trial, int32_t prev_trim, int32_t prev_err_ppm)
+{
+    __HAL_RCC_HSI_CALIBRATIONVALUE_ADJUST((uint32_t)trim);
+    hsi_cal.changed         = true;
+    hsi_cal.crossed         = crossed;
+    hsi_cal.trial           = trial;
+    hsi_cal.prev_trim       = prev_trim;
+    hsi_cal.prev_err_ppm    = prev_err_ppm;
+    hsi_cal.steps           = trim - prev_trim;
+    hsi_cal.since_change_us = 0;
+    hsi_cal.window          = false; // the current window started before the change
+}
+
 static void cal_revert()
 {
     __HAL_RCC_HSI_CALIBRATIONVALUE_ADJUST((uint32_t)hsi_cal.prev_trim);
-    if (hsi_cal.crossed)
-        hsi_cal.no_cross = true;
+    if (hsi_cal.crossed && hsi_cal.cross_fails < 255)
+        hsi_cal.cross_fails++;
     hsi_cal.changed = false;
+    hsi_cal.trial   = false;
     hsi_cal.window  = false;
 }
+
+#if defined(CAL_SEGMENTS)
+// HSICAL - HSITRIM: constant for this chip (factory calibration - 64)
+static inline int32_t cal_base()
+{
+    uint32_t icscr = RCC->ICSCR;
+    return (int32_t)((icscr & RCC_ICSCR_HSICAL)  >> RCC_ICSCR_HSICAL_Pos) -
+           (int32_t)((icscr & RCC_ICSCR_HSITRIM) >> RCC_ICSCR_HSITRIM_Pos);
+}
+
+// Block number of a trim code. A block contains the codes with HSICAL = 64*k ... 64*k + 63.
+// (+128 keeps the dividend positive, base is >= -64)
+static inline int32_t cal_block(int32_t base, int32_t trim) { return (base + trim + 128) / 64; }
+static inline int32_t cal_first(int32_t base, int32_t block) { return block * 64 - 128 - base; } // may be < 0
+static inline int32_t cal_last (int32_t base, int32_t block) { return block * 64 -  65 - base; } // may be > 127
+
+// Returns the code in the neighbour block (dir = -1: lower codes, dir = +1: higher codes) that is expected to have
+// the smallest error, or -1 if that block does not exist. 'predicted' = expected error, 'boundary' = boundary index.
+static int32_t cal_neighbour(int32_t base, int32_t trim, int32_t err_ppm, int32_t dir, int32_t* predicted, int32_t* boundary)
+{
+    int32_t block = cal_block(base, trim);
+    int32_t low, high, index;
+    if (dir < 0)
+    {
+        high  = cal_first(base, block) - 1;
+        low   = cal_first(base, block - 1);
+        index = block - 1 - cal_block(base, 0);
+        if (high < 0) return -1;
+        if (low  < 0) low = 0;
+    }
+    else
+    {
+        low   = cal_last(base, block) + 1;
+        high  = cal_last(base, block + 1);
+        index = block - cal_block(base, 0);
+        if (low  > CAL_TRIM_MAX) return -1;
+        if (high > CAL_TRIM_MAX) high = CAL_TRIM_MAX;
+    }
+    if (index < 0 || index >= CAL_BOUNDARIES) return -1;
+
+    int32_t offset100 = hsi_cal.offset100[index];
+    int32_t corr100   = err_ppm * 100 / hsi_cal.step_ppm; // error in 1/100 steps (positive = too fast)
+    int32_t target100 = (dir < 0) ? trim * 100 - offset100 - corr100 : trim * 100 + offset100 - corr100;
+
+    int32_t code = target100 < 0 ? 0 : (target100 + 50) / 100;
+    if (code < low)  code = low;
+    if (code > high) code = high;
+
+    // distance in 1/100 steps, both codes converted into the same block
+    int32_t dist100 = (dir < 0) ? code * 100 + offset100 - trim * 100
+                                : code * 100 - offset100 - trim * 100;
+    *predicted = err_ppm + (int32_t)((int64_t)dist100 * hsi_cal.step_ppm / 100);
+    if (boundary) *boundary = index;
+    return code;
+}
+
+// Learn the offset at a boundary from a jump from 'from' (error err_from) to 'to' (error err_to)
+static bool cal_learn_offset(int32_t base, int32_t from, int32_t err_from, int32_t to, int32_t err_to)
+{
+    int32_t block_from = cal_block(base, from);
+    int32_t block_to   = cal_block(base, to);
+    int32_t diff100    = (int32_t)((int64_t)(err_to - err_from) * 100 / hsi_cal.step_ppm);
+    int32_t index, offset100;
+
+    if      (block_to == block_from - 1) { index = block_to   - cal_block(base, 0); offset100 = (from - to) * 100 + diff100; }
+    else if (block_to == block_from + 1) { index = block_from - cal_block(base, 0); offset100 = (to - from) * 100 - diff100; }
+    else return false;
+
+    if (index < 0 || index >= CAL_BOUNDARIES || offset100 < CAL_OFFSET_MIN || offset100 > CAL_OFFSET_MAX)
+        return false;
+
+    bool first_time = !hsi_cal.offset_learned[index];
+    hsi_cal.offset100[index]      = offset100;
+    hsi_cal.offset_learned[index] = true;
+    return first_time;
+}
+#endif
 
 // Decide about a trim change after a valid measurement
 static void cal_evaluate(int32_t err_ppm)
 {
-    int32_t trim = cal_get_trim();
+    if (hsi_cal.disabled)
+    {
+        hsi_cal.changed = false;
+        hsi_cal.trial   = false;
+        return;
+    }
+
+    int32_t trim     = cal_get_trim();
+    bool    can_open = can_is_any_open();
+#if defined(CAL_SEGMENTS)
+    int32_t base     = cal_base();
+#endif
 
     if (hsi_cal.changed)
     {
         hsi_cal.changed = false;
         if (hsi_cal.crossed)
         {
-            if (cal_abs(err_ppm) > CAL_MAX_ERR) // the segment jump went wrong
+            if (cal_abs(err_ppm) > CAL_MAX_ERR && cal_abs(err_ppm) >= cal_abs(hsi_cal.prev_err_ppm)) // the jump went wrong
             {
                 cal_revert();
                 return;
             }
+#if defined(CAL_SEGMENTS)
+            bool learned_now = cal_learn_offset(base, hsi_cal.prev_trim, hsi_cal.prev_err_ppm, trim, err_ppm);
+
+            if (hsi_cal.trial) // keep the trial code only if it is better
+            {
+                hsi_cal.trial = false;
+                if (cal_abs(err_ppm) >= cal_abs(hsi_cal.prev_err_ppm))
+                {
+                    __HAL_RCC_HSI_CALIBRATIONVALUE_ADJUST((uint32_t)hsi_cal.prev_trim);
+                    hsi_cal.window        = false;
+                    hsi_cal.tried_trim    = hsi_cal.prev_trim;
+                    hsi_cal.tried_err_ppm = hsi_cal.prev_err_ppm;
+                }
+                else
+                {
+                    hsi_cal.tried_trim    = trim;
+                    hsi_cal.tried_err_ppm = err_ppm;
+                }
+                // The trial has learned the offset of this boundary for the first time --> evaluate again with the
+                // real offset, a different code of the neighbour block may be better than the one that was tried.
+                if (learned_now)
+                    hsi_cal.tried_trim = -1;
+                return;
+            }
+#endif
         }
         else // learn the real step size from the effect of the change
         {
@@ -325,9 +480,36 @@ static void cal_evaluate(int32_t err_ppm)
         }
     }
 
-    // Hysteresis of 60% of one step: after a correction the residual error (<= 50% step) does not trigger again.
-    if (cal_abs(err_ppm) <= hsi_cal.step_ppm * 6 / 10 || cal_abs(err_ppm) > CAL_MAX_ERR)
+    // Hysteresis: half a step plus the oscillator wander. After a correction step the residual error
+    // (step - |error|) is always below the threshold, so the trim cannot toggle between two codes.
+    int32_t threshold = hsi_cal.step_ppm / 2 + CAL_NOISE_PPM;
+    if (cal_abs(err_ppm) <= threshold)
+    {
+#if defined(CAL_SEGMENTS)
+        // Settled: try the closest code of a neighbour block if it is expected to be better.
+        // As long as the offset of that boundary is unknown, one exploratory trial is made to learn it.
+        if (!can_open && hsi_cal.cross_fails < CAL_MAX_FAILS &&
+            (trim != hsi_cal.tried_trim || cal_abs(err_ppm - hsi_cal.tried_err_ppm) > hsi_cal.step_ppm / 4))
+        {
+            int32_t pred_down, pred_up, bound_down, bound_up;
+            int32_t code_down = cal_neighbour(base, trim, err_ppm, -1, &pred_down, &bound_down);
+            int32_t code_up   = cal_neighbour(base, trim, err_ppm, +1, &pred_up,   &bound_up);
+            bool    use_up    = code_up >= 0 && (code_down < 0 || cal_abs(pred_up) < cal_abs(pred_down));
+            int32_t code      = use_up ? code_up   : code_down;
+            int32_t predicted = use_up ? pred_up   : pred_down;
+            int32_t boundary  = use_up ? bound_up  : bound_down;
+            bool    explore   = code >= 0 && !hsi_cal.offset_learned[boundary] && cal_abs(err_ppm) > hsi_cal.step_ppm / 3;
+            if (code >= 0 && (cal_abs(predicted) + CAL_NOISE_PPM < cal_abs(err_ppm) || explore))
+            {
+                cal_set_trim(code, true, true, trim, err_ppm);
+                return;
+            }
+            hsi_cal.tried_trim    = trim;
+            hsi_cal.tried_err_ppm = err_ppm;
+        }
+#endif
         return;
+    }
 
     // steps > 0 --> increase the frequency (HSI16 too slow)
     int32_t steps = (cal_abs(err_ppm) + hsi_cal.step_ppm / 2) / hsi_cal.step_ppm;
@@ -335,39 +517,41 @@ static void cal_evaluate(int32_t err_ppm)
     if (err_ppm > 0) steps = -steps;
 
     // While CAN is open only single steps (approx. 0.3%) are allowed, which the CAN bit timing tolerates.
-    bool can_open = can_is_any_open();
     if (can_open)
         steps = (steps > 0) ? 1 : -1;
 
     int32_t new_trim = trim + steps;
     bool    crossed  = false;
-
-#if defined(CAL_SEGMENTS)
-    if (trim >= CAL_SEG_LOW && new_trim < CAL_SEG_LOW) // upper --> lower segment
-    {
-        if (can_open || hsi_cal.no_cross) new_trim = CAL_SEG_LOW;
-        else { new_trim -= CAL_SEG_OFFSET; crossed = true; }
-    }
-    else if (trim < CAL_SEG_LOW && new_trim >= CAL_SEG_LOW) // lower --> upper segment
-    {
-        if (can_open || hsi_cal.no_cross) new_trim = CAL_SEG_LOW - 1;
-        else { new_trim += CAL_SEG_OFFSET; crossed = true; }
-    }
-#endif
-
     if (new_trim < 0)            new_trim = 0;
     if (new_trim > CAL_TRIM_MAX) new_trim = CAL_TRIM_MAX;
+
+#if defined(CAL_SEGMENTS)
+    int32_t block = cal_block(base, trim);
+    if (cal_block(base, new_trim) != block)
+    {
+        int32_t predicted;
+        int32_t code = (can_open || hsi_cal.cross_fails >= CAL_MAX_FAILS) ? -1 : cal_neighbour(base, trim, err_ppm, steps > 0 ? +1 : -1, &predicted, NULL);
+        if (code >= 0)
+        {
+            new_trim = code; // best code of the neighbour block
+            crossed  = true;
+        }
+        else // stay at the edge of the block
+        {
+            int32_t first = cal_first(base, block);
+            int32_t last  = cal_last (base, block);
+            if (new_trim < first) new_trim = first;
+            if (new_trim > last)  new_trim = last;
+        }
+    }
+#endif
     if (new_trim == trim)
         return;
 
-    __HAL_RCC_HSI_CALIBRATIONVALUE_ADJUST((uint32_t)new_trim);
-    hsi_cal.changed         = true;
-    hsi_cal.crossed         = crossed;
-    hsi_cal.prev_trim       = trim;
-    hsi_cal.prev_err_ppm    = err_ppm;
-    hsi_cal.steps           = new_trim - trim;
-    hsi_cal.since_change_us = 0;
-    hsi_cal.window          = false; // the current window started before the change
+    cal_set_trim(new_trim, crossed, false, trim, err_ppm);
+#if defined(CAL_SEGMENTS)
+    hsi_cal.tried_trim = -1; // the error changes --> the neighbour blocks must be evaluated again
+#endif
 }
 
 // Called from the USB interrupt on each SOF packet (every 1 ms)
