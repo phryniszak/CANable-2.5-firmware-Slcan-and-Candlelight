@@ -2,3 +2,6 @@
 
 # Build artefacts (Build/<MCU>_<Firmware>_<Board>/ with .o, .elf, .bin, .hex, .map)
 Build/STM32*/
+
+# Subproject measure_freq_nuc_g491 (STM32CubeMX + CMake, NUCLEO-G491RE)
+measure_freq_nuc_g491/build/
